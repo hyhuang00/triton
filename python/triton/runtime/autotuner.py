@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import builtins
+import inspect
+import os
 import time
-from typing import Dict
+from typing import Dict, Union, Optional
 
 from ..testing import do_bench
-from .jit import KernelInterface
+from .jit import KernelInterface, JITFunction
 
 
 class OutOfResources(Exception):
@@ -24,25 +26,26 @@ class OutOfResources(Exception):
 
 
 class Autotuner(KernelInterface):
+    """
+    :param prune_configs_by: a dict of functions that are used to prune configs, fields:
+        'perf_model': performance model used to predicate running time with different configs, returns running time
+        'top_k': number of configs to bench
+        'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
+    """
 
     def __init__(
         self,
-        fn,
-        arg_names,
-        configs,
-        key,
-        reset_to_zero,
-        restore_value,
+        fn: Union[JITFunction, Heuristics],  # A Triton JIT function
+        arg_names: Optional[list[str]],  # All names of the args of a triton JIT function
+        configs,  # Possible configs
+        key,  # Keys for the autotuner to change
+        reset_to_zero: Optional[list[str]],  # Certain tensor pointers that should be reset to zero at the beginning of each function.
+        restore_value: Optional[list[str]],  # Certain tensor pointers that should be restored after the end of each function.
         prune_configs_by: Dict = None,
         warmup=25,
         rep=100,
     ):
-        """
-        :param prune_configs_by: a dict of functions that are used to prune configs, fields:
-            'perf_model': performance model used to predicate running time with different configs, returns running time
-            'top_k': number of configs to bench
-            'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
-        """
+        # Create a default config if no config provided
         if not configs:
             self.configs = [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
         else:
@@ -80,7 +83,7 @@ class Autotuner(KernelInterface):
 
             self.post_hook = _post_hook
 
-        self.perf_model = None
+        self.perf_model = None  # A performance model for config pruning
         self.configs_top_k = 1.0
         self.early_config_prune = None
         if prune_configs_by:
@@ -89,10 +92,15 @@ class Autotuner(KernelInterface):
             self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
 
         self.fn = fn
-        self.warmup = warmup
-        self.rep = rep
+        # For reporting 
+        self.base_fn = fn
+        while not inspect.isfunction(self.base_fn):
+            self.base_fn = self.base_fn.fn
+        self.num_warmups = warmup
+        self.num_reps = rep
 
-    def _bench(self, *args, config, **meta):
+    def _bench(self, nargs, *args, config, **meta):
+        """Perform benchmarking for a config"""
         # check for conflicts, i.e. meta-parameters both provided
         # as kwargs and by the autotuner
         conflicts = meta.keys() & config.kwargs.keys()
@@ -101,7 +109,7 @@ class Autotuner(KernelInterface):
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.kwargs)
-        full_nargs = {**self.nargs, **current}
+        full_nargs = {**nargs, **current}  # FIXME
 
         def kernel_call():
             if config.pre_hook:
@@ -119,14 +127,16 @@ class Autotuner(KernelInterface):
             self.post_hook(args)
 
         try:
-            return do_bench(kernel_call, warmup=self.warmup, rep=self.rep, quantiles=(0.5, 0.2, 0.8))
+            return do_bench(kernel_call, warmup=self.num_warmups, rep=self.num_warmups, quantiles=(0.5, 0.2, 0.8))
         except OutOfResources:
             return [float("inf"), float("inf"), float("inf")]
 
     def run(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
+        # Setting the args with the args provided
+        nargs = dict(zip(self.arg_names, args))  # FIXME
+        used_cached_result = True
         if len(self.configs) > 1:
-            all_args = {**self.nargs, **kwargs}
+            all_args = {**nargs, **kwargs}
             _args = []
             for name in self.arg_names:
                 if name in all_args:
@@ -138,19 +148,25 @@ class Autotuner(KernelInterface):
             key = tuple(key)
             if key not in self.cache:
                 # prune configs
-                pruned_configs = self.prune_configs(kwargs)
+                pruned_configs = self.prune_configs(kwargs, nargs)
                 bench_start = time.time()
-                timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                timings = {config: self._bench(nargs, *args, config=config, **kwargs) for config in pruned_configs}
                 bench_end = time.time()
                 self.bench_time = bench_end - bench_start
                 self.cache[key] = builtins.min(timings, key=timings.get)
                 self.pre_hook(args, reset_only=True)
                 self.configs_timings = timings
+                used_cached_result = False
             config = self.cache[key]
         else:
             config = self.configs[0]
         self.best_config = config
-        full_nargs = {**self.nargs, **kwargs, **self.best_config.kwargs}
+        # Report best configuration
+        if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
+            print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
+                  f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
+
+        full_nargs = {**nargs, **kwargs, **self.best_config.kwargs}
         if config.pre_hook is not None:
             config.pre_hook(full_nargs)
         ret = self.fn.run(
@@ -162,13 +178,12 @@ class Autotuner(KernelInterface):
             **kwargs,
             **config.kwargs,
         )
-        self.nargs = None
         return ret
 
-    def prune_configs(self, kwargs):
+    def prune_configs(self, kwargs, nargs):
         pruned_configs = self.configs
         if self.early_config_prune:
-            pruned_configs = self.early_config_prune(self.configs, self.nargs)
+            pruned_configs = self.early_config_prune(self.configs, nargs)
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
@@ -177,7 +192,7 @@ class Autotuner(KernelInterface):
                 est_timing = {
                     config:
                     self.perf_model(
-                        **self.nargs,
+                        **nargs,
                         **kwargs,
                         **config.kwargs,
                         num_stages=config.num_stages,
@@ -192,8 +207,9 @@ class Autotuner(KernelInterface):
         return pruned_configs
 
     def warmup(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
-        for config in self.prune_configs(kwargs):
+        # Called when doing benchmarks
+        nargs = dict(zip(self.arg_names, args))  # FIXME
+        for config in self.prune_configs(kwargs, nargs):
             self.fn.warmup(
                 *args,
                 num_warps=config.num_warps,
@@ -204,7 +220,6 @@ class Autotuner(KernelInterface):
                 **kwargs,
                 **config.kwargs,
             )
-        self.nargs = None
 
 
 class Config:

@@ -211,6 +211,7 @@ class Benchmark:
         y_log: bool = False,
         color=None,
         styles=None,
+        plot_title="",
     ):
         """
         Constructor.
@@ -255,6 +256,7 @@ class Benchmark:
         self.ylabel = ylabel
         self.plot_name = plot_name
         self.args = args
+        self.plot_title = plot_title
 
 
 class Mark:
@@ -311,13 +313,13 @@ class Mark:
             ax.legend()
             ax.set_xlabel(bench.xlabel or first_x)
             ax.set_ylabel(bench.ylabel)
-            # ax.set_title(bench.plot_name)
+            ax.set_title(bench.plot_title, fontsize=12)
             ax.set_xscale("log" if bench.x_log else "linear")
             ax.set_yscale("log" if bench.y_log else "linear")
             if show_plots:
                 plt.show()
             if save_path:
-                plt.savefig(os.path.join(save_path, f"{bench.plot_name}.png"))
+                plt.savefig(os.path.join(save_path, f"{bench.plot_name}.png"), dpi=300)
         df = df[x_names + bench.line_names]
         if diff_col and df.shape[1] == 2:
             col0, col1 = df.columns.tolist()
