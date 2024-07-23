@@ -4,7 +4,7 @@ import builtins
 import inspect
 import os
 import time
-from typing import Dict, Union, Optional
+from typing import Dict, Union, Optional, Callable
 
 from ..testing import do_bench
 from .jit import KernelInterface, JITFunction
@@ -25,6 +25,10 @@ class OutOfResources(Exception):
         return (type(self), (self.required, self.limit, self.name))
 
 
+def identity_organize(arg_value, arg_name):
+    return arg_value
+
+
 class Autotuner(KernelInterface):
     """
     :param prune_configs_by: a dict of functions that are used to prune configs, fields:
@@ -42,6 +46,7 @@ class Autotuner(KernelInterface):
         reset_to_zero: Optional[list[str]],  # Certain tensor pointers that should be reset to zero at the beginning of each function.
         restore_value: Optional[list[str]],  # Certain tensor pointers that should be restored after the end of each function.
         prune_configs_by: Dict = None,
+        organize_caches_by: Optional[Callable] = None,
         warmup=25,
         rep=100,
     ):
@@ -90,6 +95,10 @@ class Autotuner(KernelInterface):
             self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
             self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
+
+        self.organize_caches_by = identity_organize
+        if organize_caches_by:
+            self.organize_caches_by = organize_caches_by
 
         self.fn = fn
         # For reporting 
@@ -141,7 +150,11 @@ class Autotuner(KernelInterface):
             for name in self.arg_names:
                 if name in all_args:
                     _args.append(all_args[name])
-            key = [_args[i] for i in self.key_idx]
+            key = []
+            for i in self.key_idx:
+                key_value, key_name = _args[i], self.arg_names[i]
+                key_value = self.organize_caches_by(key_value, key_name) 
+                key.append(key_value)
             for arg in _args:
                 if hasattr(arg, "dtype"):
                     key.append(str(arg.dtype))
@@ -163,7 +176,7 @@ class Autotuner(KernelInterface):
         self.best_config = config
         # Report best configuration
         if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
-            print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
+            print(f"Triton autotune for function {self.base_fn.__name__} with key {key} finished after "
                   f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
 
         full_nargs = {**nargs, **kwargs, **self.best_config.kwargs}
@@ -262,7 +275,8 @@ class Config:
         return ", ".join(res)
 
 
-def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, warmup=25, rep=100):
+def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, warmup=25, rep=100,
+             organize_caches_by=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -302,7 +316,10 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     """
 
     def decorator(fn):
-        return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, prune_configs_by, warmup, rep)
+        return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value,
+                         prune_configs_by=prune_configs_by,
+                         organize_caches_by=organize_caches_by,
+                         warmup=warmup, rep=rep)
 
     return decorator
 
