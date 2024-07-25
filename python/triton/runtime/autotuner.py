@@ -4,26 +4,32 @@ import builtins
 import os
 import time
 import inspect
-from typing import Dict
+from typing import Dict, Union, Optional, Callable
 
 from ..testing import do_bench, do_bench_cudagraph
-from .jit import KernelInterface
+from .jit import KernelInterface, JITFunction
 from .errors import OutOfResources
+
+
+def identity_organize(arg_value, arg_name):
+    """An identity function that serves as placeholder for cache organizer."""
+    return arg_value
 
 
 class Autotuner(KernelInterface):
 
     def __init__(
         self,
-        fn,
-        arg_names,
-        configs,
-        key,
-        reset_to_zero,
-        restore_value,
+        fn: Union[JITFunction, Heuristics], # A Triton JIT function,
+        arg_names: Optional[list[str]], # All names of the args of a triton JIT function,
+        configs, # Possible configs
+        key, # Keys for the autotuner to change
+        reset_to_zero: Optional[list[str]], # Certain tensor pointers that should be reset to zero at the beginning of each function.
+        restore_value: Optional[list[str]], # Certain tensor pointers that should be restored after the end of each function.
         pre_hook=None,
         post_hook=None,
-        prune_configs_by: Dict = None,
+        prune_configs_by: dict = None,
+        organize_caches_by: Optional[Callable] = None,
         warmup=25,
         rep=100,
         use_cuda_graph=False,
@@ -84,7 +90,12 @@ class Autotuner(KernelInterface):
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
             self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
 
+        self.organize_caches_by = identity_organize
+        if organize_caches_by:
+            self.organize_caches_by = organize_caches_by
+
         self.fn = fn
+        # For reporting
         self.base_fn = fn
         while not inspect.isfunction(self.base_fn):
             self.base_fn = self.base_fn.fn
@@ -93,7 +104,7 @@ class Autotuner(KernelInterface):
         import torch
         self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
 
-    def _bench(self, *args, config, **meta):
+    def _bench(self, nargs, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
 
         # check for conflicts, i.e. meta-parameters both provided
@@ -104,7 +115,7 @@ class Autotuner(KernelInterface):
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.all_kwargs())
-        full_nargs = {**self.nargs, **current}
+        full_nargs = {**nargs, **current}
 
         def kernel_call():
             if config.pre_hook:
@@ -135,15 +146,19 @@ class Autotuner(KernelInterface):
             return float("inf") if self.use_cuda_graph else [float("inf"), float("inf"), float("inf")]
 
     def run(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
+        nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
-            all_args = {**self.nargs, **kwargs}
+            all_args = {**nargs, **kwargs}
             _args = []
             for name in self.arg_names:
                 if name in all_args:
                     _args.append(all_args[name])
-            key = [_args[i] for i in self.key_idx]
+            key = []
+            for i in self.key_idx:
+                key_value, key_name = _args[i], self.arg_names[i]
+                key_value = self.organize_caches_by(key_value, key_name) 
+                key.append(key_value)            
             for arg in _args:
                 if hasattr(arg, "dtype"):
                     key.append(str(arg.dtype))
@@ -151,9 +166,9 @@ class Autotuner(KernelInterface):
             if key not in self.cache:
                 # prune configs
                 used_cached_result = False
-                pruned_configs = self.prune_configs(kwargs)
+                pruned_configs = self.prune_configs(kwargs, nargs)
                 bench_start = time.time()
-                timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                timings = {config: self._bench(nargs, *args, config=config, **kwargs) for config in pruned_configs}
                 bench_end = time.time()
                 self.bench_time = bench_end - bench_start
                 self.cache[key] = builtins.min(timings, key=timings.get)
@@ -164,22 +179,21 @@ class Autotuner(KernelInterface):
             config = self.configs[0]
         self.best_config = config
         if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
-            print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
+            print(f"Triton autotuning for function {self.base_fn.__name__} with key {key} finished after "
                   f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
         if config.pre_hook is not None:
-            config.pre_hook({**self.nargs, **kwargs, **config.all_kwargs()})
+            config.pre_hook({**nargs, **kwargs, **config.all_kwargs()})
         ret = self.fn.run(
             *args,
             **kwargs,
             **config.all_kwargs(),
         )
-        self.nargs = None
         return ret
 
-    def prune_configs(self, kwargs):
+    def prune_configs(self, kwargs, nargs):
         pruned_configs = self.configs
         if self.early_config_prune:
-            pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
+            pruned_configs = self.early_config_prune(self.configs, nargs, **kwargs)
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
@@ -187,7 +201,7 @@ class Autotuner(KernelInterface):
             if len(pruned_configs) > top_k:
                 est_timing = {
                     config: self.perf_model(
-                        **self.nargs,
+                        **nargs,
                         **kwargs,
                         **config.all_kwargs(),
                     )
@@ -197,15 +211,14 @@ class Autotuner(KernelInterface):
         return pruned_configs
 
     def warmup(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
+        nargs = dict(zip(self.arg_names, args))
         ret = []
-        for config in self.prune_configs(kwargs):
+        for config in self.prune_configs(kwargs, nargs):
             ret.append(self.fn.warmup(
                 *args,
                 **kwargs,
                 **config.all_kwargs(),
             ))
-        self.nargs = None
         return ret
 
 
@@ -263,7 +276,7 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=25, rep=100, use_cuda_graph=False):
+             warmup=25, rep=100, use_cuda_graph=False, organize_caches_by=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -320,7 +333,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph)
+                         use_cuda_graph=use_cuda_graph, organize_caches_by=organize_caches_by)
 
     return decorator
 
