@@ -26,6 +26,7 @@ class OutOfResources(Exception):
 
 
 def identity_organize(arg_value, arg_name):
+    """An identity function that serves as placeholder for cache organizer."""
     return arg_value
 
 
@@ -142,7 +143,7 @@ class Autotuner(KernelInterface):
 
     def run(self, *args, **kwargs):
         # Setting the args with the args provided
-        nargs = dict(zip(self.arg_names, args))  # FIXME
+        nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
             all_args = {**nargs, **kwargs}
