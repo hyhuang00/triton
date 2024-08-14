@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import pickle
 import time
 import inspect
 from typing import Dict, Union, Optional, Callable
@@ -22,17 +23,18 @@ class Autotuner(KernelInterface):
         self,
         fn: Union[JITFunction, Heuristics], # A Triton JIT function,
         arg_names: Optional[list[str]], # All names of the args of a triton JIT function,
-        configs, # Possible configs
-        key, # Keys for the autotuner to change
-        reset_to_zero: Optional[list[str]], # Certain tensor pointers that should be reset to zero at the beginning of each function.
-        restore_value: Optional[list[str]], # Certain tensor pointers that should be restored after the end of each function.
-        pre_hook=None,
-        post_hook=None,
+        configs,  # Possible configs
+        key,  # Keys for the autotuner to change
+        reset_to_zero: Optional[list[str]],  # Certain tensor pointers that should be reset to zero at the beginning of each function.
+        restore_value: Optional[list[str]],  # Certain tensor pointers that should be restored after the end of each function.
+        pre_hook = None,  # Hooks to execute before the execution of the kernel
+        post_hook = None,  # Hooks to execute after the execution of the kernel
         prune_configs_by: dict = None,
         organize_caches_by: Optional[Callable] = None,
-        warmup=25,
-        rep=100,
-        use_cuda_graph=False,
+        warmup = 25,
+        rep = 100,
+        use_cuda_graph: bool = False,  # Whether the code is expected to run under cudagraph.
+        cache_dir: str = "~/.cache/triton_kernels/",  # Cache dir used to store the cache results
     ):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
@@ -104,6 +106,25 @@ class Autotuner(KernelInterface):
         import torch
         self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
 
+        # Find the location to store the cache directory.
+        # Read the cache back if there already exists
+        self.cache_dir = cache_dir
+        cache_name = f"{self.base_fn.__name__}"
+        if self.use_cuda_graph:
+            cache_name += "_graph"
+        if self.cache_dir is not None:
+            self.cache_dir = os.path.expanduser(self.cache_dir)
+            if not os.path.exists(self.cache_dir):
+                os.makedirs(self.cache_dir)
+            self.cache_location = os.path.join(self.cache_dir, f"{cache_name}.pkl")
+            if os.path.exists(self.cache_location):
+                with open(self.cache_location, "rb") as fp:
+                    self.cache = pickle.load(fp)
+                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    print(f"Successfully retrieved Triton cache from the cache location {self.cache_location}.")
+        else:
+            self.cache_location = None
+
     def _bench(self, nargs, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
 
@@ -174,6 +195,13 @@ class Autotuner(KernelInterface):
                 self.cache[key] = builtins.min(timings, key=timings.get)
                 self.pre_hook(args, reset_only=True)
                 self.configs_timings = timings
+
+                # Save the cache if the cache location has been initialized.
+                if self.cache_location is not None:
+                    with open(self.cache_location, "wb") as fp:
+                        pickle.dump(self.cache, fp)
+                    if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                        print(f"Saved Triton cache at {self.cache_location}.")
             config = self.cache[key]
         else:
             config = self.configs[0]
