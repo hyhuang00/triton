@@ -216,7 +216,7 @@ class Autotuner(KernelInterface):
                 used_cached_result = False
                 if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
                     print(
-                        f"Triton autotuning for function {self.base_fn.__name__} with key {key} started."
+                        f"Triton autotuning for function {self.base_fn.__name__} with key {key} started.", flush=True
                     )
                 pruned_configs = self.prune_configs(kwargs, nargs)
                 bench_start = time.time()
